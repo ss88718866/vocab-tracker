@@ -4,92 +4,97 @@ import {
   Loader2, BookOpen, AlertCircle, X, Tag, Cloud, CloudOff
 } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc } from 'firebase/firestore';
 
-// 1. 稳健的环境变量读取函数
-const getSecret = (key) => {
-  try {
-    if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env[key]) {
-      return import.meta.env[key];
-    }
-    if (typeof process !== 'undefined' && process.env && process.env[key]) {
-      return process.env[key];
-    }
-  } catch (e) {}
-  return "";
-};
-
-// 2. 初始化 Firebase
+// 1. 初始化 Firebase 云端服务（在组件外部）
 let app, auth, db, rootAppId;
 
-const initSystem = () => {
-  try {
-    const config = {
-      apiKey: getSecret('VITE_FB_API_KEY'),
-      authDomain: getSecret('VITE_FB_AUTH_DOMAIN'),
-      projectId: getSecret('VITE_FB_PROJECT_ID'),
-      storageBucket: getSecret('VITE_FB_STORAGE_BUCKET'),
-      messagingSenderId: getSecret('VITE_FB_MESSAGING_SENDER_ID'),
-      appId: getSecret('VITE_FB_APP_ID'),
-      measurementId: getSecret('VITE_FB_MEASUREMENT_ID')
-    };
-
-    if (config.apiKey) {
-      app = initializeApp(config);
-      auth = getAuth(app);
-      db = getFirestore(app);
-      rootAppId = String(config.appId || 'default-app').replace(/\//g, '_');
-      return true;
-    }
-    return false;
-  } catch (err) {
-    console.error("Firebase 初始化失败:", err);
-    return false;
+try {
+  const firebaseConfig = {
+    apiKey: import.meta.env.VITE_FB_API_KEY,
+    authDomain: import.meta.env.VITE_FB_AUTH_DOMAIN,
+    projectId: import.meta.env.VITE_FB_PROJECT_ID,
+    storageBucket: import.meta.env.VITE_FB_STORAGE_BUCKET,
+    messagingSenderId: import.meta.env.VITE_FB_MESSAGING_SENDER_ID,
+    appId: import.meta.env.VITE_FB_APP_ID,
+    measurementId: import.meta.env.VITE_FB_MEASUREMENT_ID
+  };
+  
+  if (firebaseConfig.apiKey) {
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+    rootAppId = String(firebaseConfig.appId || 'default-app-id').replace(/\//g, '_');
   }
-};
-
-initSystem();
+} catch (err) {
+  console.error("Firebase 初始化失败:", err);
+}
 
 export default function App() {
   const [words, setWords] = useState([]);
   const [user, setUser] = useState(null);
+  
   const [inputText, setInputText] = useState('');
   const [isAdding, setIsAdding] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
+
+  // 筛选与搜索状态
   const [statusFilter, setStatusFilter] = useState('all');
+  const [categoryFilter, setCategoryFilter] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
 
+  // 2. 账号静默登录（保障云端数据安全隔离）
   useEffect(() => {
     if (!auth) return;
-    signInAnonymously(auth).catch(() => {});
-    const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
+    const initAuth = async () => {
+      try {
+        await signInAnonymously(auth);
+      } catch(e) {
+        console.error("认证失败", e);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
     return () => unsubscribe();
   }, []);
 
+  // 3. 实时连接并监听云端数据库
   useEffect(() => {
-    if (!user || !db || !rootAppId) return;
-    const colRef = collection(db, 'artifacts', rootAppId, 'users', user.uid, 'words');
-    const unsubscribe = onSnapshot(colRef, (snapshot) => {
-      const data = [];
-      snapshot.forEach(docSnap => data.push({ id: docSnap.id, ...docSnap.data() }));
-      setWords(data);
-    }, (err) => {
-      setErrorMsg("数据库连接受阻，请检查 Vercel 变量配置。");
+    if (!user || !db) return;
+    
+    // 定位到当前用户的专属单词集合
+    const wordsRef = collection(db, 'artifacts', rootAppId, 'users', user.uid, 'words');
+
+    // 监听云端变化（手机上添加单词，电脑端会瞬间出现）
+    const unsubscribe = onSnapshot(wordsRef, (snapshot) => {
+      const wordsData = [];
+      snapshot.forEach(docSnap => {
+        wordsData.push({ id: docSnap.id, ...docSnap.data() });
+      });
+      setWords(wordsData);
+    }, (error) => {
+      console.error("读取云端数据失败:", error);
     });
+
     return () => unsubscribe();
   }, [user]);
 
-  // 3. AI 脑细胞：增加详细错误反馈
-  const fetchAI = async (word) => {
-    const apiKey = getSecret('VITE_GEMINI_API_KEY');
-    if (!apiKey) throw new Error("缺少 AI 密钥 (VITE_GEMINI_API_KEY)。请在 Vercel 环境变量中添加并重新部署。");
+  const uniqueCategories = ['all', ...new Set(words.map(w => w.category).filter(Boolean))];
+
+  // 调用 AI 解析单词
+  const fetchWordData = async (word) => {
+    const apiKey = getEnv('VITE_GEMINI_API_KEY');
+    if (!apiKey) throw new Error("API Key 缺失，请在 Vercel 环境变量中配置 VITE_GEMINI_API_KEY");
     
-    // 🌟 按照您的建议，已强制切换为最基础、最稳定、权限要求最低的基础模型
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
     
     const payload = {
-      contents: [{ parts: [{ text: `Provide Chinese translation, British IPA, one English example, and its Chinese translation for word: "${word}". Output in strict JSON format.` }] }],
+      contents: [{ 
+        parts: [{ 
+          text: `Please provide the Chinese translation, an English example sentence, the Chinese translation of the example sentence, a suitable semantic category (in Chinese, e.g., '食物', '品质', '动作', max 4 characters), and the British English phonetic transcription (IPA format) for: "${word}". Make sure it strictly follows British English standards.` 
+        }] 
+      }],
       generationConfig: {
         responseMimeType: "application/json",
         responseSchema: {
@@ -98,206 +103,318 @@ export default function App() {
             translation: { type: "STRING" },
             example: { type: "STRING" },
             exampleTranslation: { type: "STRING" },
-            phonetic: { type: "STRING" },
-            category: { type: "STRING" }
+            category: { type: "STRING" },
+            phonetic: { type: "STRING" }
           },
-          required: ["translation", "example", "exampleTranslation", "phonetic"]
+          required: ["translation", "example", "exampleTranslation", "category", "phonetic"]
         }
       }
     };
 
-    // 增加了专门针对国内网络直连 Google API 失败的拦截提示
-    const res = await fetch(url, { 
-      method: "POST", 
-      headers: { "Content-Type": "application/json" }, 
-      body: JSON.stringify(payload) 
-    }).catch(err => {
-      throw new Error("网络请求被拦截：请检查您的网络环境，或者是否开启了全局代理以访问 Google 服务。");
-    });
-    
-    if (!res.ok) {
-        const errorDetail = await res.json().catch(() => ({}));
-        if (res.status === 403) throw new Error("AI 密钥权限不足(403)。请确认您的账号未被限制，或尝试重新生成 Key。");
-        if (res.status === 400) throw new Error("API Key 无效或格式错误(400)，请检查 Vercel 环境变量中是否填错。");
-        if (res.status === 404) throw new Error("找不到该基础 AI 模型(404)。");
-        throw new Error(`AI 解析失败 (状态码: ${res.status})。`);
+    const delays = [1000, 2000, 4000, 8000, 16000];
+    for (let i = 0; i <= delays.length; i++) {
+      try {
+        const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+        const data = await res.json();
+        return JSON.parse(data.candidates[0].content.parts[0].text);
+      } catch (err) {
+        if (i === delays.length) throw new Error("获取单词信息失败，请重试。");
+        await new Promise(resolve => setTimeout(resolve, delays[i]));
+      }
     }
-    
-    const json = await res.json();
-    return JSON.parse(json.candidates[0].content.parts[0].text);
   };
 
   const handleAddWord = async (e) => {
     e.preventDefault();
-    const word = inputText.trim();
-    if (!word || !user || isAdding) return;
-    
-    if (words.some(w => String(w.word).toLowerCase() === word.toLowerCase())) {
-        setErrorMsg(`单词 "${word}" 已经存在。`);
-        return;
+    if (!user || !db) {
+      setErrorMsg("云端数据库未连接，请检查环境配置。");
+      return;
+    }
+
+    const cleanWord = inputText.trim();
+    if (!cleanWord) return;
+
+    if (words.some(w => w?.word?.toLowerCase() === cleanWord.toLowerCase())) {
+      setErrorMsg(`单词 "${cleanWord}" 已在云端！`);
+      return;
     }
 
     setIsAdding(true);
     setErrorMsg(null);
+
     try {
-      const ai = await fetchAI(word);
+      const generatedData = await fetchWordData(cleanWord);
+      
       const newWord = {
         id: crypto.randomUUID(),
-        word: word,
-        phonetic: ai.phonetic || '',
-        translation: ai.translation || '',
-        example: ai.example || '',
-        exampleTranslation: ai.exampleTranslation || '',
-        category: ai.category || '通用',
+        word: cleanWord,
+        phonetic: generatedData.phonetic || '',
+        translation: generatedData.translation || '无翻译',
+        example: generatedData.example || '无例句',
+        exampleTranslation: generatedData.exampleTranslation || '',
+        category: generatedData.category || '其他',
         memorized: false,
         addedAt: Date.now()
       };
+
+      // 4. 将新单词推送到云端数据库
       await setDoc(doc(db, 'artifacts', rootAppId, 'users', user.uid, 'words', newWord.id), newWord);
       setInputText('');
     } catch (err) {
-      setErrorMsg(err.message);
+      setErrorMsg(err.message || "未知错误。");
     } finally {
       setIsAdding(false);
     }
   };
 
-  const toggleStatus = async (w) => {
-    await setDoc(doc(db, 'artifacts', rootAppId, 'users', user.uid, 'words', w.id), { memorized: !w.memorized }, { merge: true });
+  const toggleMemorized = async (id) => {
+    if (!user || !db) return;
+    const word = words.find(w => w.id === id);
+    if (!word) return;
+    // 更新云端状态
+    await setDoc(doc(db, 'artifacts', rootAppId, 'users', user.uid, 'words', id), { memorized: !word.memorized }, { merge: true });
   };
 
-  const removeWord = async (id) => {
+  const deleteWord = async (id) => {
+    if (!user || !db) return;
+    // 从云端删除
     await deleteDoc(doc(db, 'artifacts', rootAppId, 'users', user.uid, 'words', id));
   };
 
-  const filtered = words
-    .filter(w => statusFilter === 'all' ? true : statusFilter === 'learning' ? !w.memorized : w.memorized)
-    .filter(w => String(w.word).toLowerCase().includes(searchQuery.toLowerCase()) || String(w.translation).includes(searchQuery))
+  // 前端内存级过滤排序
+  const filteredWords = words
+    .filter(w => {
+      if (!w) return false;
+      if (statusFilter === 'learning') return !w.memorized;
+      if (statusFilter === 'memorized') return w.memorized;
+      return true;
+    })
+    .filter(w => {
+      if (categoryFilter === 'all') return true;
+      return w.category === categoryFilter;
+    })
+    .filter(w => {
+      const safeWord = w.word || '';
+      const safeTranslation = w.translation || '';
+      return safeWord.toLowerCase().includes(searchQuery.toLowerCase()) || 
+             safeTranslation.includes(searchQuery);
+    })
     .sort((a, b) => b.addedAt - a.addedAt);
 
   return (
-    <div className="min-h-screen bg-[#F8FAFC] text-slate-900 font-sans p-4 md:p-12">
-      <div className="max-w-4xl mx-auto space-y-8">
+    <div className="min-h-screen bg-gray-50 text-gray-800 font-sans p-4 md:p-8">
+      <div className="max-w-6xl mx-auto space-y-8">
         
-        {/* 精美头部 */}
-        <div className="bg-white p-8 rounded-[2.5rem] shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-100 flex flex-col md:flex-row justify-between items-center gap-8">
-          <div className="flex items-center gap-5">
-            <div className={`p-4 rounded-3xl transition-all duration-500 shadow-xl ${user ? 'bg-blue-600 text-white shadow-blue-200' : 'bg-slate-100 text-slate-400'}`}>
-              <BookOpen size={36} strokeWidth={2.5} />
+        {/* 头部区块 */}
+        <header className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
+          <div className="flex items-center gap-3">
+            <div className="bg-blue-100 p-3 rounded-xl text-blue-600 relative">
+              <BookOpen size={28} />
+              {/* 云端连接状态指示灯 */}
+              {user && db ? (
+                <div className="absolute -top-1 -right-1 bg-green-500 text-white rounded-full p-0.5 border-2 border-white" title="云端已连接">
+                  <Cloud size={10} />
+                </div>
+              ) : (
+                <div className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5 border-2 border-white" title="云端未连接">
+                  <CloudOff size={10} />
+                </div>
+              )}
             </div>
             <div>
-              <h1 className="text-3xl font-black tracking-tight text-slate-800">VocabTracker</h1>
-              <div className="mt-1.5">
-                {user ? (
-                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black bg-emerald-50 text-emerald-600 border border-emerald-100 uppercase tracking-wider">
-                    <Cloud size={14} strokeWidth={3} /> 数据云端同步中
-                  </span>
-                ) : (
-                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black bg-amber-50 text-amber-600 animate-pulse">
-                    <Loader2 size={14} className="animate-spin" /> 正在连通云端...
-                  </span>
-                )}
-              </div>
+              <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-2">
+                VocabTracker 
+              </h1>
+              <p className="text-sm text-gray-500">
+                {user && db ? '数据已开启多端实时同步' : '数据库连接中...'}
+              </p>
             </div>
           </div>
 
-          <form onSubmit={handleAddWord} className="flex w-full md:w-auto gap-3">
+          <form onSubmit={handleAddWord} className="flex gap-2 w-full md:w-auto">
             <input
               type="text"
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
-              placeholder="输入英语生词..."
-              className="flex-1 md:w-64 px-6 py-4 rounded-[1.5rem] bg-slate-50 border-2 border-transparent focus:border-blue-500 focus:bg-white focus:outline-none transition-all font-bold placeholder:text-slate-400"
-              disabled={isAdding || !user}
+              placeholder="输入一个英语单词..."
+              className="flex-1 md:w-64 px-4 py-2.5 rounded-xl border border-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+              disabled={isAdding || !user || !db}
             />
             <button
               type="submit"
-              disabled={isAdding || !inputText.trim() || !user}
-              className="px-8 py-4 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-[1.5rem] font-black shadow-lg shadow-blue-200 transition-all disabled:opacity-50 flex items-center gap-2"
+              disabled={isAdding || !inputText.trim() || !user || !db}
+              className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
             >
-              {isAdding ? <Loader2 size={20} className="animate-spin" /> : <Plus size={20} strokeWidth={3} />}
-              添加
+              {isAdding ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} />}
+              <span className="hidden sm:inline">{isAdding ? '解析中...' : '添加'}</span>
             </button>
           </form>
-        </div>
+        </header>
 
         {errorMsg && (
-          <div className="bg-rose-50 border-2 border-rose-100 text-rose-700 p-5 rounded-[1.5rem] flex items-center justify-between shadow-sm animate-in slide-in-from-top-4">
+          <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded-r-xl flex items-start justify-between shadow-sm">
             <div className="flex items-center gap-3">
-              <AlertCircle size={22} strokeWidth={2.5} />
-              <span className="text-sm font-bold tracking-tight leading-relaxed">{errorMsg}</span>
+              <AlertCircle className="text-red-500" size={20} />
+              <p className="text-red-700 text-sm font-medium">{errorMsg}</p>
             </div>
-            <button onClick={() => setErrorMsg(null)} className="hover:bg-rose-100 p-2 rounded-full transition-colors"><X size={18} /></button>
+            <button onClick={() => setErrorMsg(null)} className="text-red-400 hover:text-red-600">
+              <X size={18} />
+            </button>
           </div>
         )}
 
-        <div className="space-y-6">
-          <div className="flex flex-col sm:flex-row gap-4 justify-between items-center px-2">
-            <div className="flex p-1.5 bg-white rounded-2xl border border-slate-200 shadow-sm w-full sm:w-auto">
-              {['all', 'learning', 'memorized'].map(f => (
+        {/* 控制栏 */}
+        <div className="flex flex-col space-y-4">
+          <div className="flex flex-col sm:flex-row justify-between items-center gap-4">
+            <div className="flex bg-white rounded-xl shadow-sm border border-gray-100 p-1 w-full sm:w-auto">
+              {['all', 'learning', 'memorized'].map((f) => (
                 <button
                   key={f}
                   onClick={() => setStatusFilter(f)}
-                  className={`flex-1 px-6 py-2.5 rounded-xl text-sm font-black transition-all ${
-                    statusFilter === f ? 'bg-slate-900 text-white shadow-lg' : 'text-slate-500 hover:bg-slate-50'
+                  className={`flex-1 sm:px-6 py-2 rounded-lg text-sm font-medium transition-all ${
+                    statusFilter === f 
+                      ? 'bg-blue-50 text-blue-700 shadow-sm' 
+                      : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'
                   }`}
                 >
-                  {f === 'all' ? '全部' : f === 'learning' ? '学习中' : '已掌握'}
+                  {f === 'all' && '全部状态'}
+                  {f === 'learning' && '学习中'}
+                  {f === 'memorized' && '已掌握'}
                 </button>
               ))}
             </div>
+
             <div className="relative w-full sm:w-72">
-              <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="搜索单词..."
-                className="w-full pl-11 pr-5 py-3.5 bg-white rounded-2xl border border-slate-200 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm font-bold"
+                placeholder="搜索云端单词..."
+                className="w-full pl-10 pr-4 py-2.5 bg-white rounded-xl shadow-sm border border-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all text-sm"
               />
             </div>
           </div>
+          
+          {uniqueCategories.length > 1 && (
+            <div className="flex items-center gap-2 overflow-x-auto pb-2 scrollbar-hide">
+              <Tag size={16} className="text-gray-400 shrink-0 ml-1" />
+              {uniqueCategories.map(cat => (
+                <button
+                  key={cat}
+                  onClick={() => setCategoryFilter(cat)}
+                  className={`shrink-0 px-4 py-1.5 rounded-full text-xs font-medium transition-colors border ${
+                    categoryFilter === cat
+                      ? 'bg-indigo-50 border-indigo-200 text-indigo-700'
+                      : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                  }`}
+                >
+                  {cat === 'all' ? '全部分类' : cat}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
 
-          <div className="grid grid-cols-1 gap-4">
-            {filtered.length > 0 ? filtered.map(w => (
-              <div key={w.id} className="bg-white p-6 rounded-[2rem] border border-slate-100 shadow-sm hover:shadow-xl hover:border-blue-100 transition-all group flex flex-col md:flex-row justify-between gap-6 overflow-hidden">
-                <div className="space-y-4 flex-1">
-                  <div className="flex items-baseline gap-3">
-                    <h3 className={`text-2xl font-black ${w.memorized ? 'text-slate-300 line-through' : 'text-slate-900'}`}>{w.word}</h3>
-                    <span className="text-sm font-mono font-bold text-slate-400 bg-slate-50 px-2 py-0.5 rounded-lg italic">[{w.phonetic}]</span>
-                    <span className="text-blue-600 font-black text-xl">{w.translation}</span>
-                  </div>
-                  <div className={`p-5 rounded-2xl border-l-4 transition-all ${w.memorized ? 'bg-slate-50/50 border-slate-200' : 'bg-blue-50/30 border-blue-500'}`}>
-                    <p className={`text-[15px] leading-relaxed font-bold ${w.memorized ? 'text-slate-400' : 'text-slate-700'} italic`}>"{w.example}"</p>
-                    <p className="text-xs font-black text-slate-400 mt-2 uppercase tracking-widest">{w.exampleTranslation}</p>
-                  </div>
-                </div>
-                
-                <div className="flex md:flex-col justify-end gap-3 shrink-0">
-                  <button 
-                    onClick={() => toggleStatus(w)}
-                    className={`flex-1 md:flex-none px-6 py-3 rounded-2xl font-black text-sm flex items-center justify-center gap-2 transition-all ${
-                      w.memorized ? 'bg-emerald-50 text-emerald-600 shadow-inner' : 'bg-slate-50 text-slate-500 hover:bg-blue-50 hover:text-blue-600'
-                    }`}
-                  >
-                    {w.memorized ? <CheckCircle size={20} strokeWidth={3} /> : <Circle size={20} strokeWidth={3} />}
-                    {w.memorized ? "已掌握" : "记一下"}
-                  </button>
-                  <button 
-                    onClick={() => removeWord(w.id)}
-                    className="p-3 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded-2xl transition-all"
-                  >
-                    <Trash2 size={20} strokeWidth={2.5} />
-                  </button>
-                </div>
-              </div>
-            )) : (
-              <div className="py-24 flex flex-col items-center justify-center text-slate-200 bg-white rounded-[3rem] border-2 border-dashed border-slate-100">
-                <BookOpen size={100} strokeWidth={1} className="mb-4 opacity-10" />
-                <p className="text-xl font-black tracking-tight text-slate-300">还没有添加任何单词哦</p>
-              </div>
-            )}
+        {/* 单词表格 */}
+        <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th scope="col" className="px-6 py-4 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider w-1/4">
+                    单词 & 释义
+                  </th>
+                  <th scope="col" className="px-6 py-4 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider w-1/2">
+                    例句
+                  </th>
+                  <th scope="col" className="px-6 py-4 text-center text-xs font-semibold text-gray-500 uppercase tracking-wider w-1/4">
+                    状态 & 操作
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-100">
+                {filteredWords.length > 0 ? (
+                  filteredWords.map((word) => (
+                    <tr key={word.id} className="hover:bg-gray-50/50 transition-colors group">
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <div className="flex flex-col items-start">
+                          <div className="flex items-baseline gap-2">
+                            <span className={`text-lg font-bold ${word.memorized ? 'text-gray-400 line-through' : 'text-gray-900'}`}>
+                              {word.word}
+                            </span>
+                            {word.phonetic && (
+                              <span className={`font-mono text-sm ${word.memorized ? 'text-gray-400' : 'text-gray-500'}`}>
+                                {word.phonetic}
+                              </span>
+                            )}
+                          </div>
+                          <span className="text-sm text-blue-600 font-medium mt-1">
+                            {word.translation}
+                          </span>
+                          {word.category && (
+                            <span className={`mt-2 px-2 py-0.5 text-[10px] rounded border ${word.memorized ? 'bg-gray-50 border-gray-200 text-gray-400' : 'bg-indigo-50 border-indigo-100 text-indigo-600'}`}>
+                              {word.category}
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-6 py-4">
+                        <div className="flex flex-col gap-1 max-w-lg">
+                          <span className={`text-sm ${word.memorized ? 'text-gray-400' : 'text-gray-700'} font-medium whitespace-normal`}>
+                            {word.example}
+                          </span>
+                          <span className="text-xs text-gray-500 whitespace-normal mt-1">
+                            {word.exampleTranslation}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-center">
+                        <div className="flex items-center justify-center gap-3">
+                          <button
+                            onClick={() => toggleMemorized(word.id)}
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
+                              word.memorized 
+                                ? 'bg-green-50 text-green-700 hover:bg-green-100' 
+                                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                            }`}
+                            title={word.memorized ? "标记为未掌握" : "标记为已掌握"}
+                          >
+                            {word.memorized ? (
+                              <><CheckCircle size={16} /> 已掌握</>
+                            ) : (
+                              <><Circle size={16} /> 学习中</>
+                            )}
+                          </button>
+                          
+                          <button
+                            onClick={() => deleteWord(word.id)}
+                            className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100 sm:opacity-100"
+                            title="删除单词"
+                          >
+                            <Trash2 size={18} />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan="3" className="px-6 py-16 text-center">
+                      <div className="flex flex-col items-center justify-center text-gray-400 gap-3">
+                        <BookOpen size={48} className="opacity-20" />
+                        <p className="text-base font-medium">云端词库空空如也</p>
+                        <p className="text-sm">试着在上方添加一个新的单词吧！</p>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
           </div>
         </div>
+        
       </div>
     </div>
   );
